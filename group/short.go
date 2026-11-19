@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"slices"
+	"sync"
 
 	optP384 "github.com/cloudflare/circl/ecc/p384"
 	"github.com/cloudflare/circl/expander"
@@ -109,29 +110,43 @@ func (g wG) Params() *Params {
 }
 
 func (g wG) HashToElementNonUniform(b, dst []byte) Element {
-	var u [1]big.Int
-	mapping, h, L := g.mapToCurveParams()
-	xmd := expander.NewExpanderMD(h, dst)
-	HashToField(u[:], b, xmd, g.c.Params().P, L)
-	return mapping(&u[0])
+	ws := sswuWorkspacePool.Get().(*sswuWorkspace)
+	defer sswuWorkspacePool.Put(ws)
+	sp := g.sswuParams()
+	xmd := expander.NewExpanderMD(sp.h, dst)
+	HashToField(ws.u[:1], b, xmd, sp.P, sp.L)
+	if sp.bitSize == 256 {
+		x, y := p256MapToCurve(&ws.u[0])
+		return &wElt{x, y, g}
+	}
+	return g.sswu3mod4Map(ws, sp, &ws.u[0])
 }
 
 func (g wG) HashToElement(b, dst []byte) Element {
-	var u [2]big.Int
-	mapping, h, L := g.mapToCurveParams()
-	xmd := expander.NewExpanderMD(h, dst)
-	HashToField(u[:], b, xmd, g.c.Params().P, L)
-	Q0 := mapping(&u[0])
-	Q1 := mapping(&u[1])
+	ws := sswuWorkspacePool.Get().(*sswuWorkspace)
+	defer sswuWorkspacePool.Put(ws)
+	sp := g.sswuParams()
+	xmd := expander.NewExpanderMD(sp.h, dst)
+	HashToField(ws.u[:2], b, xmd, sp.P, sp.L)
+	if sp.bitSize == 256 {
+		x0, y0 := p256MapToCurve(&ws.u[0])
+		x1, y1 := p256MapToCurve(&ws.u[1])
+		Q0 := &wElt{x0, y0, g}
+		Q1 := &wElt{x1, y1, g}
+		return Q0.Add(Q0, Q1)
+	}
+	Q0 := g.sswu3mod4Map(ws, sp, &ws.u[0])
+	Q1 := g.sswu3mod4Map(ws, sp, &ws.u[1])
 	return Q0.Add(Q0, Q1)
 }
 
 func (g wG) HashToScalar(b, dst []byte) Scalar {
-	var u [1]big.Int
-	_, h, L := g.mapToCurveParams()
-	xmd := expander.NewExpanderMD(h, dst)
-	HashToField(u[:], b, xmd, g.c.Params().N, L)
-	return g.zeroScalar().SetBigInt(&u[0])
+	ws := sswuWorkspacePool.Get().(*sswuWorkspace)
+	defer sswuWorkspacePool.Put(ws)
+	sp := g.sswuParams()
+	xmd := expander.NewExpanderMD(sp.h, dst)
+	HashToField(ws.u[:1], b, xmd, g.c.Params().N, sp.L)
+	return g.zeroScalar().SetBigInt(&ws.u[0])
 }
 
 type wElt struct {
@@ -406,56 +421,94 @@ func isLessThanBE(x, y []byte) int {
 	return 1 - subtle.ConstantTimeLessOrEq(int(y[j]), int(x[j]))
 }
 
-func (g wG) mapToCurveParams() (mapping func(u *big.Int) *wElt, h crypto.Hash, L uint) {
-	var Z, C2 big.Int
-	switch g.c.Params().BitSize {
+// sswuParams holds the constants of the Simplified SWU map for curves with
+// p = 3 (mod 4). Instances are computed once per curve and shared read-only.
+type sswuParams struct {
+	h       crypto.Hash
+	L       uint
+	bitSize int
+	Z       *big.Int
+	C2      *big.Int
+	A       *big.Int
+	B       *big.Int
+	P       *big.Int
+	one     *big.Int
+	c1      *big.Int // (P - 3) / 4
+}
+
+// sswuParamsCache stores one *sswuParams per curve, keyed by field bit size.
+var sswuParamsCache sync.Map
+
+func (g wG) sswuParams() *sswuParams {
+	params := g.c.Params()
+	bitSize := params.BitSize
+	if v, ok := sswuParamsCache.Load(bitSize); ok {
+		return v.(*sswuParams)
+	}
+
+	sp := &sswuParams{
+		A:       big.NewInt(-3),
+		B:       params.B,
+		P:       params.P,
+		one:     big.NewInt(1),
+		Z:       new(big.Int),
+		C2:      new(big.Int),
+		bitSize: bitSize,
+	}
+	switch bitSize {
 	case 256:
-		Z.SetInt64(-10)
-		C2.SetString("0x78bc71a02d89ec07214623f6d0f955072c7cc05604a5a6e23ffbf67115fa5301", 0)
-		h = crypto.SHA256
-		L = 48
+		sp.Z.SetInt64(-10)
+		sp.C2.SetString("0x78bc71a02d89ec07214623f6d0f955072c7cc05604a5a6e23ffbf67115fa5301", 0)
+		sp.h = crypto.SHA256
+		sp.L = 48
 	case 384:
-		Z.SetInt64(-12)
-		C2.SetString("0x19877cc1041b7555743c0ae2e3a3e61fb2aaa2e0e87ea557a563d8b598a0940d0a697a9e0b9e92cfaa314f583c9d066", 0)
-		h = crypto.SHA384
-		L = 72
+		sp.Z.SetInt64(-12)
+		sp.C2.SetString("0x19877cc1041b7555743c0ae2e3a3e61fb2aaa2e0e87ea557a563d8b598a0940d0a697a9e0b9e92cfaa314f583c9d066", 0)
+		sp.h = crypto.SHA384
+		sp.L = 72
 	case 521:
-		Z.SetInt64(-4)
-		C2.SetInt64(8)
-		h = crypto.SHA512
-		L = 98
+		sp.Z.SetInt64(-4)
+		sp.C2.SetInt64(8)
+		sp.h = crypto.SHA512
+		sp.L = 98
 	default:
 		panic("curve not supported")
 	}
-	return func(u *big.Int) *wElt { return g.sswu3mod4Map(u, &Z, &C2) }, h, L
+	sp.c1 = new(big.Int).Sub(sp.P, big.NewInt(3))
+	sp.c1.Rsh(sp.c1, 2) // c1 = (q - 3) / 4
+
+	actual, _ := sswuParamsCache.LoadOrStore(bitSize, sp)
+	return actual.(*sswuParams)
 }
 
-func (g wG) sswu3mod4Map(u *big.Int, Z, C2 *big.Int) *wElt {
-	tv1 := new(big.Int)
-	tv2 := new(big.Int)
-	tv3 := new(big.Int)
-	tv4 := new(big.Int)
-	xn := new(big.Int)
-	xd := new(big.Int)
-	x1n := new(big.Int)
-	x2n := new(big.Int)
-	gx1 := new(big.Int)
-	gxd := new(big.Int)
-	y1 := new(big.Int)
-	y2 := new(big.Int)
-	x := new(big.Int)
-	y := new(big.Int)
+// sswuWorkspace gathers the temporary big.Int values used by one invocation
+// of the SSWU map, so they can be reused across calls instead of allocating
+// fresh temporaries every time. A workspace must be used by a single
+// goroutine at a time; sswuWorkspacePool hands them out, which makes
+// concurrent HashToElement/HashToScalar calls safe without sharing state.
+type sswuWorkspace struct {
+	u                  [2]big.Int
+	tv1, tv2, tv3, tv4 big.Int
+	xn, xd, x1n, x2n   big.Int
+	gx1, gxd           big.Int
+	y1, y2, x, y       big.Int
+}
 
-	A := big.NewInt(-3)
-	B := g.c.Params().B
-	p := g.c.Params().P
-	c1 := new(big.Int)
-	c1.Sub(p, big.NewInt(3)).Rsh(c1, 2) // 1.  c1 = (q - 3) / 4
+var sswuWorkspacePool = sync.Pool{
+	New: func() any { return new(sswuWorkspace) },
+}
+
+func (g wG) sswu3mod4Map(ws *sswuWorkspace, sp *sswuParams, u *big.Int) *wElt {
+	tv1, tv2, tv3, tv4 := &ws.tv1, &ws.tv2, &ws.tv3, &ws.tv4
+	xn, xd, x1n, x2n := &ws.xn, &ws.xd, &ws.x1n, &ws.x2n
+	gx1, gxd := &ws.gx1, &ws.gxd
+	y1, y2, x, y := &ws.y1, &ws.y2, &ws.x, &ws.y
+
+	A, B, p := sp.A, sp.B, sp.P
 
 	add := func(c, a, b *big.Int) { c.Add(a, b).Mod(c, p) }
 	mul := func(c, a, b *big.Int) { c.Mul(a, b).Mod(c, p) }
 	sqr := func(c, a *big.Int) { c.Mul(a, a).Mod(c, p) }
-	exp := func(c, a, b *big.Int) { c.Exp(a, b, p) }
 	sgn := func(a *big.Int) uint { a.Mod(a, p); return a.Bit(0) }
 	cmv := func(c, a, b *big.Int, k bool) {
 		if k {
@@ -465,46 +518,48 @@ func (g wG) sswu3mod4Map(u *big.Int, Z, C2 *big.Int) *wElt {
 		}
 	}
 
-	sqr(tv1, u)                 // 1.  tv1 = u^2
-	mul(tv3, Z, tv1)            // 2.  tv3 = Z * tv1
-	sqr(tv2, tv3)               // 3.  tv2 = tv3^2
-	add(xd, tv2, tv3)           // 4.   xd = tv2 + tv3
-	add(x1n, xd, big.NewInt(1)) // 5.  x1n = xd + 1
-	mul(x1n, x1n, B)            // 6.  x1n = x1n * B
-	tv4.Neg(A)                  //
-	mul(xd, tv4, xd)            // 7.   xd = -A * xd
-	e1 := xd.Sign() == 0        // 8.   e1 = xd == 0
-	mul(tv4, Z, A)              //
-	cmv(xd, xd, tv4, e1)        // 9.   xd = CMOV(xd, Z * A, e1)
-	sqr(tv2, xd)                // 10. tv2 = xd^2
-	mul(gxd, tv2, xd)           // 11. gxd = tv2 * xd
-	mul(tv2, A, tv2)            // 12. tv2 = A * tv2
-	sqr(gx1, x1n)               // 13. gx1 = x1n^2
-	add(gx1, gx1, tv2)          // 14. gx1 = gx1 + tv2
-	mul(gx1, gx1, x1n)          // 15. gx1 = gx1 * x1n
-	mul(tv2, B, gxd)            // 16. tv2 = B * gxd
-	add(gx1, gx1, tv2)          // 17. gx1 = gx1 + tv2
-	sqr(tv4, gxd)               // 18. tv4 = gxd^2
-	mul(tv2, gx1, gxd)          // 19. tv2 = gx1 * gxd
-	mul(tv4, tv4, tv2)          // 20. tv4 = tv4 * tv2
-	exp(y1, tv4, c1)            // 21.  y1 = tv4^c1
-	mul(y1, y1, tv2)            // 22.  y1 = y1 * tv2
-	mul(x2n, tv3, x1n)          // 23. x2n = tv3 * x1n
-	mul(y2, y1, C2)             // 24.  y2 = y1 * c2
-	mul(y2, y2, tv1)            // 25.  y2 = y2 * tv1
-	mul(y2, y2, u)              // 26.  y2 = y2 * u
-	sqr(tv2, y1)                // 27. tv2 = y1^2
-	mul(tv2, tv2, gxd)          // 28. tv2 = tv2 * gxd
-	e2 := tv2.Cmp(gx1) == 0     // 29.  e2 = tv2 == gx1
-	cmv(xn, x2n, x1n, e2)       // 30.  xn = CMOV(x2n, x1n, e2)
-	cmv(y, y2, y1, e2)          // 31.   y = CMOV(y2, y1, e2)
-	e3 := sgn(u) == sgn(y)      // 32.  e3 = sgn0(u) == sgn0(y)
-	tv1.Neg(y)                  //
-	cmv(y, tv1, y, e3)          // 33.   y = CMOV(-y, y, e3)
-	tv1.ModInverse(xd, p)       //
-	mul(x, xn, tv1)             // 34. return (xn, xd, y, 1)
+	sqr(tv1, u)             // 1.  tv1 = u^2
+	mul(tv3, sp.Z, tv1)     // 2.  tv3 = Z * tv1
+	sqr(tv2, tv3)           // 3.  tv2 = tv3^2
+	add(xd, tv2, tv3)       // 4.   xd = tv2 + tv3
+	add(x1n, xd, sp.one)    // 5.  x1n = xd + 1
+	mul(x1n, x1n, B)        // 6.  x1n = x1n * B
+	tv4.Neg(A)              //
+	mul(xd, tv4, xd)        // 7.   xd = -A * xd
+	e1 := xd.Sign() == 0    // 8.   e1 = xd == 0
+	mul(tv4, sp.Z, A)       //
+	cmv(xd, xd, tv4, e1)    // 9.   xd = CMOV(xd, Z * A, e1)
+	sqr(tv2, xd)            // 10. tv2 = xd^2
+	mul(gxd, tv2, xd)       // 11. gxd = tv2 * xd
+	mul(tv2, A, tv2)        // 12. tv2 = A * tv2
+	sqr(gx1, x1n)           // 13. gx1 = x1n^2
+	add(gx1, gx1, tv2)      // 14. gx1 = gx1 + tv2
+	mul(gx1, gx1, x1n)      // 15. gx1 = gx1 * x1n
+	mul(tv2, B, gxd)        // 16. tv2 = B * gxd
+	add(gx1, gx1, tv2)      // 17. gx1 = gx1 + tv2
+	sqr(tv4, gxd)           // 18. tv4 = gxd^2
+	mul(tv2, gx1, gxd)      // 19. tv2 = gx1 * gxd
+	mul(tv4, tv4, tv2)      // 20. tv4 = tv4 * tv2
+	y1.Exp(tv4, sp.c1, p)   // 21.  y1 = tv4^c1
+	mul(y1, y1, tv2)        // 22.  y1 = y1 * tv2
+	mul(x2n, tv3, x1n)      // 23. x2n = tv3 * x1n
+	mul(y2, y1, sp.C2)      // 24.  y2 = y1 * c2
+	mul(y2, y2, tv1)        // 25.  y2 = y2 * tv1
+	mul(y2, y2, u)          // 26.  y2 = y2 * u
+	sqr(tv2, y1)            // 27. tv2 = y1^2
+	mul(tv2, tv2, gxd)      // 28. tv2 = tv2 * gxd
+	e2 := tv2.Cmp(gx1) == 0 // 29.  e2 = tv2 == gx1
+	cmv(xn, x2n, x1n, e2)   // 30.  xn = CMOV(x2n, x1n, e2)
+	cmv(y, y2, y1, e2)      // 31.   y = CMOV(y2, y1, e2)
+	e3 := sgn(u) == sgn(y)  // 32.  e3 = sgn0(u) == sgn0(y)
+	tv1.Neg(y)              //
+	cmv(y, tv1, y, e3)      // 33.   y = CMOV(-y, y, e3)
+	tv1.ModInverse(xd, p)   //
+	mul(x, xn, tv1)         // 34. return (xn, xd, y, 1)
 	y.Mod(y, p)
-	return &wElt{x, y, g}
+	// The returned element owns fresh big.Int values: workspace temporaries
+	// are recycled by the pool and must never escape into results.
+	return &wElt{new(big.Int).Set(x), new(big.Int).Set(y), g}
 }
 
 var (
